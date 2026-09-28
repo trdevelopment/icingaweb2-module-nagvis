@@ -4,6 +4,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use Icinga\Module\Icingadb\Common\Database;
+use Icinga\Module\Icingadb\Model\DependencyEdge;
+use Icinga\Module\Icingadb\Model\DependencyNode;
 use Icinga\Module\Icingadb\Model\Host;
 use Icinga\Module\Icingadb\Model\Hostgroup;
 use Icinga\Module\Icingadb\Model\Instance;
@@ -389,13 +391,27 @@ class GlobalBackendicingadb implements GlobalBackendInterface
 
     public function getHostNamesWithNoParent()
     {
-        // As Icinga DB doesn't support dependencies at the moment, just get all available hosts
-        $query = Host::on($this->getDb());
-        $query->columns(['name']);
+        // Icinga DB is now synced with dependency_node/dependency_edge, so hosts that
+        // appear as a "child" in some edge do have a parent and must be excluded here.
+        $hostIdsWithParent = [];
+
+        $edges = DependencyEdge::on($this->getDb())
+            ->with('child.host')
+            ->filter(Filter::unlike('child.service.id', '*'));
+
+        foreach ($edges as $edge) {
+            if ($edge->child !== null && $edge->child->host !== null) {
+                $hostIdsWithParent[$edge->child->host->id] = true;
+            }
+        }
+
+        $query = Host::on($this->getDb())->columns(['id', 'name']);
 
         $results = [];
         foreach ($query as $item) {
-            $results[] = $item->name;
+            if (! isset($hostIdsWithParent[$item->id])) {
+                $results[] = $item->name;
+            }
         }
 
         return $results;
@@ -403,8 +419,7 @@ class GlobalBackendicingadb implements GlobalBackendInterface
 
     public function getDirectChildNamesByHostName($hostName)
     {
-        // FIXME: Implement me once https://github.com/Icinga/icingadb/issues/347 is closed
-        return [];
+        return $this->getDependentHostNamesByHostName($hostName, false);
     }
 
     public function getDirectChildDependenciesNamesByHostName($hostName, $minBusinessImpact = false): array
@@ -414,13 +429,47 @@ class GlobalBackendicingadb implements GlobalBackendInterface
 
     public function getDirectParentNamesByHostName($hostName)
     {
-        // FIXME: Implement me once https://github.com/Icinga/icingadb/issues/347 is closed
-        return [];
+        return $this->getDependentHostNamesByHostName($hostName, true);
     }
 
     public function getDirectParentDependenciesNamesByHostName($hostName, $minBusinessImpact = false): array
     {
         return $this->getDirectParentNamesByHostName($hostName);
+    }
+
+    /**
+     * Resolve the host names directly connected to $hostName via a dependency edge
+     *
+     * @param string $hostName
+     * @param bool   $fetchParents Whether to fetch the hosts $hostName depends on (true)
+     *                             or the hosts that depend on $hostName (false)
+     *
+     * @return string[]
+     */
+    private function getDependentHostNamesByHostName($hostName, $fetchParents)
+    {
+        $host = Host::on($this->getDb())
+            ->columns(['id'])
+            ->filter(Filter::equal('name', $hostName))
+            ->first();
+
+        if ($host === null) {
+            return [];
+        }
+
+        $nodes = DependencyNode::forHost($host->id, $this->getDb(), $fetchParents)
+            ->with('host');
+
+        $results = [];
+        foreach ($nodes as $node) {
+            // Service- or redundancy-group-based dependency nodes have no host
+            // and can't be represented on a host-only automap, so skip them.
+            if ($node->host !== null) {
+                $results[] = $node->host->name;
+            }
+        }
+
+        return $results;
     }
 
     public function getHostNamesInHostgroup($hostGroupName): array
@@ -619,3 +668,4 @@ class GlobalBackendicingadb implements GlobalBackendInterface
         return ! $time ? null : $time->getTimestamp();
     }
 }
+
